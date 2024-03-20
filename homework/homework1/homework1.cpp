@@ -47,13 +47,13 @@ public:
 	};
 
 	// Single vertex buffer for all primitives
-	struct {
+	struct Vertices{
 		VkBuffer buffer;
 		VkDeviceMemory memory;
 	} vertices;
 
 	// Single index buffer for all primitives
-	struct {
+	struct Indices {
 		int count;
 		VkBuffer buffer;
 		VkDeviceMemory memory;
@@ -78,9 +78,16 @@ public:
 	// A node represents an object in the glTF scene graph
 	struct Node {
 		Node* parent;
+		uint32_t index;
 		std::vector<Node*> children;
 		Mesh mesh;
+		glm::vec3 translation{};
+		glm::vec3 scale{ 1.0f };
+		glm::quat rotation{};
 		glm::mat4 matrix;
+		glm::mat4 getLocalMatrix() {
+			return glm::translate(glm::mat4(1.0f), translation) * glm::mat4(rotation) * glm::scale(glm::mat4(1.0f), scale) * matrix;
+		}
 		~Node() {
 			for (auto& child : children) {
 				delete child;
@@ -107,6 +114,34 @@ public:
 	struct Texture {
 		int32_t imageIndex;
 	};
+	
+	/*
+		Animation related structures
+	*/
+
+	struct AnimationSampler
+	{
+		std::string interpolation;
+		std::vector<float> inputs;
+		std::vector<glm::vec4> outputsVec4;
+	};
+
+	struct AnimationChannel
+	{
+		std::string path;
+		Node* node;
+		uint32_t samplerIndex;
+	};
+
+	struct Animation
+	{
+		std::string name;
+		std::vector<AnimationSampler> samplers;
+		std::vector<AnimationChannel> channels;
+		float start = std::numeric_limits<float>::max();
+		float end = std::numeric_limits<float>::min();
+		float currentTime = 0.0f;
+	};
 
 	/*
 		Model data
@@ -115,6 +150,9 @@ public:
 	std::vector<Texture> textures;
 	std::vector<Material> materials;
 	std::vector<Node*> nodes;
+	std::vector<Animation> animations;
+
+	uint32_t activeAnimation = 0;
 
 	~VulkanglTFModel()
 	{
@@ -201,23 +239,131 @@ public:
 		}
 	}
 
-	void loadNode(const tinygltf::Node& inputNode, const tinygltf::Model& input, VulkanglTFModel::Node* parent, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
+	// Helper functions for loading gltf nodes
+
+	Node* findNode(Node* parent, uint32_t index)
+	{
+		if (parent->index == index) {
+			return parent;
+		}
+		for (auto& child : parent->children) {
+			auto* node = findNode(child, index);
+			if (node) {
+				return node;
+			}
+		}
+		return nullptr;
+	}
+
+	Node* nodeFromIndex(uint32_t index)
+	{
+		for (auto& node : nodes) {
+			auto* found = findNode(node, index);
+			if (found) {
+				return found;
+			}
+		}
+		return nullptr;
+	}
+
+	// POI: Load the animations from the glTF model
+	void loadAnimations(tinygltf::Model &input) {
+		animations.resize(input.animations.size());
+
+		for(size_t i = 0; i < input.animations.size(); i++) {
+			tinygltf::Animation glTFAnimation = input.animations[i];
+			animations[i].name = glTFAnimation.name;
+
+			// Samplers
+			animations[i].samplers.resize(glTFAnimation.samplers.size());
+			for(size_t j = 0; j < glTFAnimation.samplers.size(); j++) {
+				tinygltf::AnimationSampler glTFSampler = glTFAnimation.samplers[j];
+				AnimationSampler& dstSampler = animations[i].samplers[j];
+				dstSampler.interpolation = glTFSampler.interpolation;
+
+				// Read sampler keyframe from time values
+				{
+					const tinygltf::Accessor& accessor = input.accessors[glTFSampler.input];
+					const tinygltf::BufferView& bufferView = input.bufferViews[accessor.bufferView];
+					const tinygltf::Buffer& buffer = input.buffers[bufferView.buffer];
+					const void* dataPtr = &buffer.data[accessor.byteOffset + bufferView.byteOffset];
+					const float* buf = static_cast<const float*>(dataPtr);
+					for(size_t index = 0; index < accessor.count; index++) {
+						dstSampler.inputs.push_back(buf[index]);
+					}
+					// Adjust animation's start and end times
+					for(auto input : animations[i].samplers[j].inputs) {
+						if(input < animations[i].start) {
+							animations[i].start = input;
+						}
+						if(input > animations[i].end) {
+							animations[i].end = input;
+						}
+					}
+				}
+				
+				// Read sampler keyframe output translate/rotate/scale values
+				{
+					const tinygltf::Accessor& accessor = input.accessors[glTFSampler.output];
+					const tinygltf::BufferView& bufferView = input.bufferViews[accessor.bufferView];
+					const tinygltf::Buffer& buffer = input.buffers[bufferView.buffer];
+					const void* dataPtr = &buffer.data[accessor.byteOffset + bufferView.byteOffset];
+					switch(accessor.type) {
+						case TINYGLTF_TYPE_VEC3: {
+							const glm::vec3 *buf = static_cast<const glm::vec3 *>(dataPtr);
+							for (size_t index = 0; index < accessor.count; index++) {
+								dstSampler.outputsVec4.push_back(glm::vec4(buf[index], 0.0f));
+							}
+							break;
+						}
+						case TINYGLTF_TYPE_VEC4: {
+							const glm::vec4 *buf = static_cast<const glm::vec4 *>(dataPtr);
+							for (size_t index = 0; index < accessor.count; index++) {
+								dstSampler.outputsVec4.push_back(buf[index]);
+							}
+							break;
+						}
+						default: {
+							std::cout << "unknown type" << std::endl;
+							break;
+						}
+					}
+				}
+			}
+
+			// Channels
+			animations[i].channels.resize(glTFAnimation.channels.size());
+			for (size_t j = 0; j < glTFAnimation.channels.size(); j++) {
+				tinygltf::AnimationChannel glTFChannel = glTFAnimation.channels[j];
+				AnimationChannel &         dstChannel  = animations[i].channels[j];
+				dstChannel.path                        = glTFChannel.target_path;
+				dstChannel.samplerIndex                = glTFChannel.sampler;
+				dstChannel.node                        = nodeFromIndex(glTFChannel.target_node);
+			}
+		}
+	}
+
+	void loadNode(const tinygltf::Node& inputNode, const tinygltf::Model& input, VulkanglTFModel::Node* parent, uint32_t nodeIndex, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
 	{
 		VulkanglTFModel::Node* node = new VulkanglTFModel::Node{};
 		node->matrix = glm::mat4(1.0f);
 		node->parent = parent;
+		node->index = nodeIndex;
 
 		// Get the local node matrix
 		// It's either made up from translation, rotation, scale or a 4x4 matrix
 		if (inputNode.translation.size() == 3) {
-			node->matrix = glm::translate(node->matrix, glm::vec3(glm::make_vec3(inputNode.translation.data())));
+			// node->matrix = glm::translate(node->matrix, glm::vec3(glm::make_vec3(inputNode.translation.data())));
+			node->translation = glm::make_vec3(inputNode.translation.data());
 		}
 		if (inputNode.rotation.size() == 4) {
 			glm::quat q = glm::make_quat(inputNode.rotation.data());
-			node->matrix *= glm::mat4(q);
+			node->rotation = glm::mat4(q);
+			//node->matrix *= glm::mat4(q);
 		}
 		if (inputNode.scale.size() == 3) {
-			node->matrix = glm::scale(node->matrix, glm::vec3(glm::make_vec3(inputNode.scale.data())));
+			node->scale = glm::make_vec3(inputNode.scale.data());
+			// node->matrix = glm::scale(node->matrix, glm::vec3(glm::make_vec3(inputNode.scale.data())));
 		}
 		if (inputNode.matrix.size() == 16) {
 			node->matrix = glm::make_mat4x4(inputNode.matrix.data());
@@ -226,7 +372,7 @@ public:
 		// Load node's children
 		if (inputNode.children.size() > 0) {
 			for (size_t i = 0; i < inputNode.children.size(); i++) {
-				loadNode(input.nodes[inputNode.children[i]], input , node, indexBuffer, vertexBuffer);
+				loadNode(input.nodes[inputNode.children[i]], input , node, inputNode.children[i], indexBuffer, vertexBuffer);
 			}
 		}
 
@@ -331,6 +477,80 @@ public:
 	}
 
 	/*
+	glTF vertex skinning functions
+	*/
+
+	// POI: Traverse the node hierarchy to the top-most parent to get the local matrix of the given node
+	glm::mat4 getNodeMatrix(Node* node)
+	{
+		glm::mat4 nodeMatrix = node->getLocalMatrix();
+		Node* currentParent = node->parent;
+		while (currentParent) {
+			nodeMatrix = currentParent->getLocalMatrix() * nodeMatrix;
+			currentParent = currentParent->parent;
+		}
+		return nodeMatrix;
+	}
+
+	// POI: Update the current animation
+	void updateAnimation(float deltaTime) {
+		if (activeAnimation > static_cast<uint32_t>(animations.size()) - 1)
+		{
+			std::cout << "No animation with index " << activeAnimation << std::endl;
+			return;
+		}
+		Animation &animation = animations[activeAnimation];
+		animation.currentTime += deltaTime;
+		if (animation.currentTime > animation.end)
+		{
+			animation.currentTime -= animation.end;
+		}
+
+		for (auto &channel : animation.channels)
+		{
+			AnimationSampler &sampler = animation.samplers[channel.samplerIndex];
+			for (size_t i = 0; i < sampler.inputs.size() - 1; i++)
+			{
+				if (sampler.interpolation != "LINEAR")
+				{
+					std::cout << "This sample only supports linear interpolations\n";
+					continue;
+				}
+
+				// Get the input keyframe values for the current time stamp
+				if ((animation.currentTime >= sampler.inputs[i]) && (animation.currentTime <= sampler.inputs[i + 1]))
+				{
+					float a = (animation.currentTime - sampler.inputs[i]) / (sampler.inputs[i + 1] - sampler.inputs[i]);
+					if (channel.path == "translation")
+					{
+						channel.node->translation = glm::mix(sampler.outputsVec4[i], sampler.outputsVec4[i + 1], a);
+					}
+					if (channel.path == "rotation")
+					{
+						glm::quat q1;
+						q1.x = sampler.outputsVec4[i].x;
+						q1.y = sampler.outputsVec4[i].y;
+						q1.z = sampler.outputsVec4[i].z;
+						q1.w = sampler.outputsVec4[i].w;
+
+						glm::quat q2;
+						q2.x = sampler.outputsVec4[i + 1].x;
+						q2.y = sampler.outputsVec4[i + 1].y;
+						q2.z = sampler.outputsVec4[i + 1].z;
+						q2.w = sampler.outputsVec4[i + 1].w;
+
+						channel.node->rotation = glm::normalize(glm::slerp(q1, q2, a));
+					}
+					if (channel.path == "scale")
+					{
+						channel.node->scale = glm::mix(sampler.outputsVec4[i], sampler.outputsVec4[i + 1], a);
+					}
+				}
+			}
+		}
+	}
+
+	/*
 		glTF rendering functions
 	*/
 
@@ -340,10 +560,10 @@ public:
 		if (node->mesh.primitives.size() > 0) {
 			// Pass the node's matrix via push constants
 			// Traverse the node hierarchy to the top-most parent to get the final matrix of the current node
-			glm::mat4 nodeMatrix = node->matrix;
+			glm::mat4 nodeMatrix = node->getLocalMatrix();
 			VulkanglTFModel::Node* currentParent = node->parent;
 			while (currentParent) {
-				nodeMatrix = currentParent->matrix * nodeMatrix;
+				nodeMatrix = currentParent->getLocalMatrix() * nodeMatrix;
 				currentParent = currentParent->parent;
 			}
 			// Pass the final matrix to the vertex shader using push constants
@@ -382,6 +602,7 @@ class VulkanExample : public VulkanExampleBase
 {
 public:
 	bool wireframe = false;
+	bool bAnimation = false;
 
 	VulkanglTFModel glTFModel;
 
@@ -509,8 +730,9 @@ public:
 			const tinygltf::Scene& scene = glTFInput.scenes[0];
 			for (size_t i = 0; i < scene.nodes.size(); i++) {
 				const tinygltf::Node node = glTFInput.nodes[scene.nodes[i]];
-				glTFModel.loadNode(node, glTFInput, nullptr, indexBuffer, vertexBuffer);
+				glTFModel.loadNode(node, glTFInput, nullptr, scene.nodes[i], indexBuffer, vertexBuffer);
 			}
+			glTFModel.loadAnimations(glTFInput);
 		}
 		else {
 			vks::tools::exitFatal("Could not open the glTF file.\n\nThe file is part of the additional asset pack.\n\nRun \"download_assets.py\" in the repository root to download the latest version.", -1);
@@ -738,6 +960,13 @@ public:
 		if (camera.updated) {
 			updateUniformBuffers();
 		}
+		// POI: Advance animation
+		if(!paused) {
+			glTFModel.updateAnimation(frameTimer);
+		}
+		if(bAnimation) {
+			buildCommandBuffers();
+		}
 	}
 
 	virtual void viewChanged()
@@ -751,6 +980,8 @@ public:
 			if (overlay->checkBox("Wireframe", &wireframe)) {
 				buildCommandBuffers();
 			}
+		}
+		if(overlay->checkBox("Animation", &bAnimation)) {
 		}
 	}
 };
