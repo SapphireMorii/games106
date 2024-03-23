@@ -33,11 +33,12 @@
 // This class is heavily simplified (compared to glTF's feature set) but retains the basic glTF structure
 class VulkanglTFModel
 {
+private:
+	vks::Texture2D emptyTexture;
 public:
 	// The class requires some Vulkan objects so it can create it's own resources
 	vks::VulkanDevice* vulkanDevice;
 	VkQueue copyQueue;
-
 	// The vertex layout for the samples' model
 	struct Vertex {
 		glm::vec3 pos;
@@ -99,7 +100,6 @@ public:
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
 	struct Material {
 		glm::vec4 baseColorFactor = glm::vec4(1.0f);
-		glm::vec3 emissiveFactor = glm::vec3(0.0f);
 		uint32_t baseColorTextureIndex;
 		uint32_t normalTextureIndex;
 		uint32_t metallicRoughnessTextureIndex;
@@ -113,6 +113,8 @@ public:
 		// We also store (and create) a descriptor set that's used to access this texture from the fragment shader
 		VkDescriptorSet descriptorSet;
 		VkDescriptorSet descriptorSetNormal;
+		VkDescriptorSet descriptorSetMetallicRoughness;
+		VkDescriptorSet descriptorSetEmissive;
 	};
 
 	// A glTF texture stores a reference to the image and a sampler
@@ -178,6 +180,108 @@ public:
 		}
 	}
 
+	void createEmptyTexture() {
+		emptyTexture.device = vulkanDevice;
+		emptyTexture.width = 1;
+		emptyTexture.height = 1;
+		emptyTexture.layerCount = 1;
+		emptyTexture.mipLevels = 1;
+
+		size_t bufferSize = emptyTexture.width * emptyTexture.height * 4;
+		unsigned char* buffer = new unsigned char[bufferSize];
+		memset(buffer, 0, bufferSize);
+
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingMemory;
+		VkBufferCreateInfo bufferCreateInfo = vks::initializers::bufferCreateInfo();
+		bufferCreateInfo.size = bufferSize;
+		// This buffer is used as a transfer source for the buffer copy
+		bufferCreateInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VK_CHECK_RESULT(vkCreateBuffer(vulkanDevice->logicalDevice, &bufferCreateInfo, nullptr, &stagingBuffer));
+
+		VkMemoryAllocateInfo memAllocInfo = vks::initializers::memoryAllocateInfo();
+		VkMemoryRequirements memReqs;
+		vkGetBufferMemoryRequirements(vulkanDevice->logicalDevice, stagingBuffer, &memReqs);
+		memAllocInfo.allocationSize = memReqs.size;
+		memAllocInfo.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		VK_CHECK_RESULT(vkAllocateMemory(vulkanDevice->logicalDevice, &memAllocInfo, nullptr, &stagingMemory));
+		VK_CHECK_RESULT(vkBindBufferMemory(vulkanDevice->logicalDevice, stagingBuffer, stagingMemory, 0));
+
+		// Copy texture data into staging buffer
+		uint8_t* data;
+		VK_CHECK_RESULT(vkMapMemory(vulkanDevice->logicalDevice, stagingMemory, 0, memReqs.size, 0, (void**)&data));
+		memcpy(data, buffer, bufferSize);
+		vkUnmapMemory(vulkanDevice->logicalDevice, stagingMemory);
+
+		VkBufferImageCopy bufferCopyRegion = {};
+		bufferCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		bufferCopyRegion.imageSubresource.layerCount = 1;
+		bufferCopyRegion.imageExtent.width = emptyTexture.width;
+		bufferCopyRegion.imageExtent.height = emptyTexture.height;
+		bufferCopyRegion.imageExtent.depth = 1;
+
+		// Create optimal tiled target image
+		VkImageCreateInfo imageCreateInfo = vks::initializers::imageCreateInfo();
+		imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		imageCreateInfo.mipLevels = 1;
+		imageCreateInfo.arrayLayers = 1;
+		imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageCreateInfo.extent = { emptyTexture.width, emptyTexture.height, 1 };
+		imageCreateInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VK_CHECK_RESULT(vkCreateImage(vulkanDevice->logicalDevice, &imageCreateInfo, nullptr, &emptyTexture.image));
+
+		vkGetImageMemoryRequirements(vulkanDevice->logicalDevice, emptyTexture.image, &memReqs);
+		memAllocInfo.allocationSize = memReqs.size;
+		memAllocInfo.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		VK_CHECK_RESULT(vkAllocateMemory(vulkanDevice->logicalDevice, &memAllocInfo, nullptr, &emptyTexture.deviceMemory));
+		VK_CHECK_RESULT(vkBindImageMemory(vulkanDevice->logicalDevice, emptyTexture.image, emptyTexture.deviceMemory, 0));
+
+		VkImageSubresourceRange subresourceRange{};
+		subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		subresourceRange.baseMipLevel = 0;
+		subresourceRange.levelCount = 1;
+		subresourceRange.layerCount = 1;
+
+		VkCommandBuffer copyCmd = vulkanDevice->createCommandBuffer(VK_COMMAND_BUFFER_LEVEL_PRIMARY, true);
+		vks::tools::setImageLayout(copyCmd, emptyTexture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, subresourceRange);
+		vkCmdCopyBufferToImage(copyCmd, stagingBuffer, emptyTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bufferCopyRegion);
+		vks::tools::setImageLayout(copyCmd, emptyTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, subresourceRange);
+		vulkanDevice->flushCommandBuffer(copyCmd, copyQueue);
+		emptyTexture.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+		// Clean up staging resources
+		vkFreeMemory(vulkanDevice->logicalDevice, stagingMemory, nullptr);
+		vkDestroyBuffer(vulkanDevice->logicalDevice, stagingBuffer, nullptr);
+
+		VkSamplerCreateInfo samplerCreateInfo = vks::initializers::samplerCreateInfo();
+		samplerCreateInfo.magFilter = VK_FILTER_LINEAR;
+		samplerCreateInfo.minFilter = VK_FILTER_LINEAR;
+		samplerCreateInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+		samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		samplerCreateInfo.compareOp = VK_COMPARE_OP_NEVER;
+		samplerCreateInfo.maxAnisotropy = 1.0f;
+		VK_CHECK_RESULT(vkCreateSampler(vulkanDevice->logicalDevice, &samplerCreateInfo, nullptr, &emptyTexture.sampler));
+
+		VkImageViewCreateInfo viewCreateInfo = vks::initializers::imageViewCreateInfo();
+		viewCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		viewCreateInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		viewCreateInfo.subresourceRange.levelCount = 1;
+		viewCreateInfo.image = emptyTexture.image;
+		VK_CHECK_RESULT(vkCreateImageView(vulkanDevice->logicalDevice, &viewCreateInfo, nullptr, &emptyTexture.view));
+
+		emptyTexture.descriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		emptyTexture.descriptor.imageView = emptyTexture.view;
+		emptyTexture.descriptor.sampler = emptyTexture.sampler;
+	}
+
 	/*
 		glTF loading functions
 
@@ -188,7 +292,7 @@ public:
 	{
 		// Images can be stored inside the glTF (which is the case for the sample model), so instead of directly
 		// loading them from disk, we fetch them from the glTF loader and upload the buffers
-		images.resize(input.images.size());
+		images.resize(input.images.size() + 1);
 		for (size_t i = 0; i < input.images.size(); i++) {
 			tinygltf::Image& glTFImage = input.images[i];
 			// Get the image data from the glTF loader
@@ -218,6 +322,8 @@ public:
 				delete[] buffer;
 			}
 		}
+		createEmptyTexture();
+		images[images.size() - 1].texture = emptyTexture;
 	}
 
 	void loadTextures(tinygltf::Model& input)
@@ -244,6 +350,16 @@ public:
 			}// Get normal texture index
 			if(glTFMaterial.additionalValues.find("normalTexture") != glTFMaterial.additionalValues.end()) {
 				materials[i].normalTextureIndex = glTFMaterial.additionalValues["normalTexture"].TextureIndex();
+			}
+			// Get metallic roughness texture index
+			if (glTFMaterial.values.find("metallicRoughnessTexture") != glTFMaterial.values.end()) {
+				materials[i].metallicRoughnessTextureIndex = glTFMaterial.values["metallicRoughnessTexture"].TextureIndex();
+			}
+			// Get emissive texture index
+			if(glTFMaterial.additionalValues.find("emissiveTexture") != glTFMaterial.additionalValues.end()) {
+				materials[i].emissiveTextureIndex = glTFMaterial.additionalValues["emissiveTexture"].TextureIndex();
+			}else {
+				materials[i].emissiveTextureIndex = -1;
 			}
 		}
 	}
@@ -596,6 +712,20 @@ public:
 					texture = textures[materials[primitive.materialIndex].normalTextureIndex];
 					// Bind the descriptor for the current primitive's normal texture
 					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 2, 1, &images[texture.imageIndex].descriptorSetNormal, 0, nullptr);
+					// get the metallic roughness texture index for this primitive
+					texture = textures[materials[primitive.materialIndex].metallicRoughnessTextureIndex];
+					// Bind the descriptor for the current primitive's metallic roughness texture
+					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 3, 1, &images[texture.imageIndex].descriptorSetMetallicRoughness, 0, nullptr);
+					// get the emissive texture index for this primitive
+					uint32_t emissiveTextureIndex = materials[primitive.materialIndex].emissiveTextureIndex;
+					if(emissiveTextureIndex != -1) {
+						texture = textures[emissiveTextureIndex];
+						// Bind the descriptor for the current primitive's emissive texture
+						vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 4, 1, &images[texture.imageIndex].descriptorSetEmissive, 0, nullptr);
+					} else {
+						// Bind the descriptor for the empty texture
+						vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 4, 1, &images[images.size() - 1].descriptorSetEmissive, 0, nullptr);
+					}
 					vkCmdDrawIndexed(commandBuffer, primitive.indexCount, 1, primitive.firstIndex, 0, 0);
 				}
 			}
@@ -649,6 +779,8 @@ public:
 		VkDescriptorSetLayout matrices;
 		VkDescriptorSetLayout textures;
 		VkDescriptorSetLayout normalTextures;
+		VkDescriptorSetLayout metallicRoughnessTextures;
+		VkDescriptorSetLayout emissiveTextures;
 	} descriptorSetLayouts;
 
 	VulkanExample() : VulkanExampleBase(ENABLE_VALIDATION)
@@ -674,6 +806,8 @@ public:
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.matrices, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.textures, nullptr);
 		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.normalTextures, nullptr);
+		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.metallicRoughnessTextures, nullptr);
+		vkDestroyDescriptorSetLayout(device, descriptorSetLayouts.emissiveTextures, nullptr);
 
 		shaderData.buffer.destroy();
 	}
@@ -849,10 +983,10 @@ public:
 		std::vector<VkDescriptorPoolSize> poolSizes = {
 			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
 			// One combined image sampler per model image/texture
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size() * 2)),
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size() * 4)),
 		};
 		// One set for matrices and one per model image/texture
-		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size() * 2) + 1;
+		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size() * 4) + 1;
 		VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, maxSetCount);
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
@@ -869,8 +1003,29 @@ public:
 		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.normalTextures));
 		
-		// Pipeline layout using both descriptor sets (set 0 = matrices, set 1 = material, set 2 = normal texture)
-		std::array<VkDescriptorSetLayout, 3> setLayouts = { descriptorSetLayouts.matrices, descriptorSetLayouts.textures, descriptorSetLayouts.normalTextures };
+		// Descriptor set layout for passing metallic roughness map textures
+		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
+		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.metallicRoughnessTextures));
+
+		// Descriptor set layout for passing emissive map textures
+		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
+		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.emissiveTextures));
+
+		// Pipeline layout using both descriptor sets 
+		/*
+		set 0 : Scene matrices
+		set 1 : Material textures
+		set 2 : Normal map textures
+		set 3 : Metallic roughness map textures
+		set 4 : Emissive map textures
+		*/
+		std::array<VkDescriptorSetLayout, 5> setLayouts = {
+			descriptorSetLayouts.matrices, 
+			descriptorSetLayouts.textures, 
+			descriptorSetLayouts.normalTextures,
+			descriptorSetLayouts.metallicRoughnessTextures,
+			descriptorSetLayouts.emissiveTextures
+			};
 		VkPipelineLayoutCreateInfo pipelineLayoutCI= vks::initializers::pipelineLayoutCreateInfo(setLayouts.data(), static_cast<uint32_t>(setLayouts.size()));
 		// We will use push constants to push the local matrices of a primitive to the vertex shader
 		VkPushConstantRange pushConstantRange = vks::initializers::pushConstantRange(VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), 0);
@@ -886,13 +1041,25 @@ public:
 		vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		// Descriptor sets for materials
 		for (auto& image : glTFModel.images) {
+			// Descriptor set for material textures
 			const VkDescriptorSetAllocateInfo allocInfo1 = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
 			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo1, &image.descriptorSet));
 			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+			// Descriptor set for normal map textures
 			const VkDescriptorSetAllocateInfo allocInfo2 = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.normalTextures, 1);
 			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo2, &image.descriptorSetNormal));
 			writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSetNormal, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
+			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+			// Descriptor set for metallic roughness map textures
+			const VkDescriptorSetAllocateInfo allocInfo3 = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.metallicRoughnessTextures, 1);
+			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo3, &image.descriptorSetMetallicRoughness));
+			writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSetMetallicRoughness, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
+			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+			// Descriptor set for emissive map textures
+			const VkDescriptorSetAllocateInfo allocInfo4 = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.emissiveTextures, 1);
+			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo4, &image.descriptorSetEmissive));
+			writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSetEmissive, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
 			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		}
 	}

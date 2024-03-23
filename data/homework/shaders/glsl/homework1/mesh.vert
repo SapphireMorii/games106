@@ -27,14 +27,12 @@ layout (location = 5) out vec4 outTangent;
 
 void main() 
 {
-	outNormal = inNormal;
 	outColor = inColor;
 	outUV = inUV;
 	gl_Position = uboScene.projection * uboScene.view * primitive.model * vec4(inPos.xyz, 1.0);
 	
-	vec4 pos = uboScene.view * vec4(inPos, 1.0);
-	outNormal = mat3(uboScene.view) * inNormal;
-	vec3 lPos = mat3(uboScene.view) * uboScene.lightPos.xyz;
+	vec4 pos = primitive.model * vec4(inPos, 1.0);
+	outNormal = mat3(primitive.model) * inNormal;
 	outLightVec = uboScene.lightPos.xyz - pos.xyz;
 	outViewVec = uboScene.viewPos.xyz - pos.xyz;	
 
